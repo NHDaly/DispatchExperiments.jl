@@ -1,0 +1,8 @@
+name = "Dispatch"
+uuid = "e45f0777-afac-4b1d-ae46-62ee8c4f09dc"
+authors = ["Nathan Daly <nhdaly@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+MacroTools = "1914dd2f-81c6-5fcd-8719-6d5c9610ff09"
+Memoize = "c03570c3-d221-55d1-a50c-7939bbd78826"
