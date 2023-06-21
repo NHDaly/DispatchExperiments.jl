@@ -75,28 +75,29 @@ macro override(func::Expr)
     @assert "`@override function ... end` should be placed inside an `@extend` struct definition."
 end
 
-#macro polymorphic(call::Expr)
-#    @assert call.head == :call
-#    this = call.args[2]
-#    p = gensym(:p)
-#    r = gensym(:r)
-#    obj = gensym(:this)
-#    call.args[2] = :(p
-#    quote
-#        @invoke
-#        $obj = $this
-#        local $r
-#        $p = if $ismutable($obj)
-#            $pointer_from_objref($obj)
-#        else
-#            $r = $Ref($obj)
-#            $pointer_from_objref($r)
-#        end
-#        $GC.@preserve $r begin
-#            $(call)
-#        end
-#    end)
-#end
+macro polymorphic(call::Expr)
+    @assert call.head == :call
+    esc(quote
+        $polymorphic_call($(call.args...))
+    end)
+end
+@noinline function polymorphic_call(func::F, this, args...) where F
+    obj = this
+    local r
+    p = if ismutable(obj)
+        r = obj
+        pointer_from_objref(obj)
+    else
+        # This is the last allocation I'm left with, and I know I can fix it!
+        # This will be fixed in https://github.com/JuliaLang/julia/pull/50136
+        r = Ref(obj)
+        pointer_from_objref(r)
+    end
+    p = reinterpret(Ptr{Cvoid}, p)
+    GC.@preserve r begin
+        return func(p, args...)
+    end
+end
 
 
 function _emit_virtual_func(__module__::Module, BaseType, spec, func_expr::Expr)
@@ -104,30 +105,14 @@ function _emit_virtual_func(__module__::Module, BaseType, spec, func_expr::Expr)
     return_type = func_expr.args[1].args[2]
     func = Core.eval(__module__, :(function $name end))
     idx = _declare_virtual_method!(spec, func)
-    #dump(BaseType)
-    #@show BaseType, ismutabletype(BaseType)
-    if ismutabletype(BaseType)
-        return quote
-            function $(esc(name))(this::$(esc(BaseType)))::$(esc(return_type))
-                p = pointer_from_objref(this)
-                vtable = unsafe_load(reinterpret(Ptr{VTable}, p), 1)
-                f_ptr = vtable.func_ptrs[$idx]
-                # TODO: arg types
-                ccall(f_ptr, Int, (Ptr{Cvoid},), p)
-            end
-        end
-    else
-        return quote
-            function $(esc(name))(this::$(esc(BaseType)))::$(esc(return_type))
-                r = Ref(this)
-                GC.@preserve r begin
-                    p = pointer_from_objref(r)
-                    vtable = unsafe_load(reinterpret(Ptr{VTable}, p), 1)
-                    f_ptr = vtable.func_ptrs[$idx]
-                    # TODO: arg types
-                    ccall(f_ptr, Int, (Ptr{Cvoid},), p)
-                end
-            end
+    return quote
+        function $(esc(name))(this::Ptr{Cvoid})::$(esc(return_type))
+            p = this
+            vtable = unsafe_load(reinterpret(Ptr{VTable}, p), 1)
+            # TODO: Make this safe
+            f_ptr = @inbounds vtable.func_ptrs[$idx]
+            # TODO: arg types
+            ccall(f_ptr, Int, (Ptr{Cvoid},), p)
         end
     end
 end
@@ -138,11 +123,22 @@ function _emit_override_func(__module__::Module, spec, vtable, type, func_expr::
     wrapper_name = gensym(:wrapper)
     f_ptr_name = gensym(:f_ptr)
     return esc(quote
-        $fname = $func_expr
-        function $wrapper_name(this::Ptr{Cvoid})
-            o = unsafe_load(reinterpret(Ptr{$type}, this))
-            return $fname(o)
-        end
+        const $fname = $func_expr
+        $(if ismutabletype(type)
+            quote
+                @inline function $wrapper_name(this::Ptr{Cvoid})
+                    o = $unsafe_pointer_to_objref(this)
+                    return $fname(o::$type)
+                end
+            end
+        else
+            quote
+                @inline function $wrapper_name(this::Ptr{Cvoid})
+                    o = unsafe_load(reinterpret(Ptr{$type}, this))::$type
+                    return $fname(o::$type)
+                end
+            end
+        end)
         # TODO: arg types
         const $f_ptr_name = @eval @cfunction($wrapper_name, Int, (Ptr{Cvoid},))
         $_define_virtual_method!($spec, $vtable, $fname, $f_ptr_name)

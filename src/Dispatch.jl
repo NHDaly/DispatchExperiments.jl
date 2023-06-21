@@ -1,5 +1,6 @@
 module Dispatch
 
-greet() = print("Hello World!")
+include("single-dispatch.jl")
+export SingleDispatch
 
 end # module Dispatch
