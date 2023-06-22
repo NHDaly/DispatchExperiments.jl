@@ -94,21 +94,31 @@ end
 fname_mutable(name) = Symbol("@$(name)-mutable")
 fname_immutable(name) = Symbol("@$(name)-immutable")
 
+function _args_split(func_expr::Expr)
+    args = func_expr.args[1].args[1].args[3:end]
+    @assert all(a->(a isa Expr && a.head == :(::)), args)  "All function args (after the first) must have fully specified C types (for now at least)."
+    arg_types = [arg.args[2] for arg in args]
+    @assert all(a->(a isa Expr && a.head == :(::) && length(a.args) == 2), args)  "All function args (after the first) must have names."
+    arg_names = [arg.args[1] for arg in args]
+    return args, arg_names, arg_types
+end
+
 function _emit_virtual_func(__module__::Module, BaseType, spec, func_expr::Expr)
     name = func_expr.args[1].args[1].args[1]
     name_mutable = fname_mutable(name)
     name_immutable = fname_immutable(name)
     return_type = func_expr.args[1].args[2]
     func = Core.eval(__module__, :(function $name end))
+    args, arg_names, arg_types = _args_split(func_expr)
     idx = _declare_virtual_method!(spec, func)
     return quote
         # Force inline to ensure no dispatch to this function
-        @inline function $(esc(name_mutable))(obj)::$(esc(return_type))
+        @inline function $(esc(name_mutable))(obj, args...)::$(esc(return_type))
             p = _unsafe_pointer_from_objref(obj)
-            return do_dispatch(p::Ptr{Cvoid})
+            return do_dispatch(p::Ptr{Cvoid}, args...)
         end
         # Force inline to ensure no dispatch to this function
-        @inline function $(esc(name_immutable))(obj)::$(esc(return_type))
+        @inline function $(esc(name_immutable))(obj, args...)::$(esc(return_type))
             # This is the last allocation we're left with.. It's the same as seen in
             # https://github.com/JuliaLang/julia/issues/44244#issuecomment-1236165936
             # It's annoying, because the whole reason someone is using this `@polymorphic`
@@ -123,15 +133,15 @@ function _emit_virtual_func(__module__::Module, BaseType, spec, func_expr::Expr)
             GC.@preserve r begin
                 #Core.println("before dispatch")
                 obj_ptr = unsafe_load(reinterpret(Ptr{Ptr{Cvoid}}, ref_ptr))
-                return do_dispatch(obj_ptr::Ptr{Cvoid})
+                return do_dispatch(obj_ptr::Ptr{Cvoid}, args...)
             end
         end
-        function do_dispatch(p::Ptr{Cvoid})
+        function do_dispatch(p::Ptr{Cvoid}, $(args...))
             vtable = unsafe_load(reinterpret(Ptr{VTable}, p), 1)
             # TODO: Make this safe
             f_ptr = @inbounds(vtable.func_ptrs[$idx])::Ptr{Cvoid}
             # TODO: arg types
-            ccall(f_ptr, $return_type, (Ptr{Cvoid},), p)
+            ccall(f_ptr, $return_type, (Ptr{Cvoid}, $(arg_types...)), p, $(arg_names...))
         end
     end
 end
@@ -145,6 +155,7 @@ function _emit_override_func(__module__::Module, spec, vtable, type, func_expr::
     #@assert func_expr.args[1].args[1].args[2].args[2] === :(Ptr{$type})
     fname = gensym(:func)
     @assert func_expr.args[1].head == :(::) "@override Must specify return value"
+    args, arg_names, arg_types = _args_split(func_expr)
     return_type = func_expr.args[1].args[2]
     wrapper_name = gensym(:wrapper)
     f_ptr_name = gensym(:f_ptr)
@@ -152,21 +163,22 @@ function _emit_override_func(__module__::Module, spec, vtable, type, func_expr::
         const $fname = $func_expr
         $(if ismutabletype(type)
             quote
-                function $wrapper_name(this::Ptr{Cvoid})
+                function $wrapper_name(this::Ptr{Cvoid}, $(args...))
+                    @info "inside wrapper. Args: $args"
                     o = $unsafe_pointer_to_objref(this)
-                    return $fname(o::$type)
+                    return $fname(o::$type, $(arg_names...))
                 end
             end
         else
             quote
-                function $wrapper_name(this::Ptr{Cvoid})
+                function $wrapper_name(this::Ptr{Cvoid}, $(args...))
                     o = unsafe_load(reinterpret(Ptr{$type}, this))::$type
-                    return $fname(o::$type)
+                    return $fname(o::$type, $(arg_names...))
                 end
             end
         end)
         # TODO: arg types
-        const $f_ptr_name = @eval @cfunction($wrapper_name, $return_type, (Ptr{Cvoid},))
+        const $f_ptr_name = @eval @cfunction($wrapper_name, $return_type, (Ptr{Cvoid}, $(arg_types...)))
         $_define_virtual_method!($spec, $vtable, $fname, $f_ptr_name)
     end)
 end
