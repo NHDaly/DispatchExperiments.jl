@@ -77,70 +77,113 @@ end
 
 macro polymorphic(call::Expr)
     @assert call.head == :call
+    name = call.args[1]
+    mutable_name = fname_mutable(name)
+    immutable_name = fname_immutable(name)
+    this = call.args[2]
     esc(quote
-        $polymorphic_call($(call.args...))
+        this = $this
+        if ismutable(this)
+            $mutable_name(this, $(call.args[3:end]...))
+        else
+            $immutable_name(this, $(call.args[3:end]...))
+        end
     end)
 end
-@noinline function polymorphic_call(func::F, this, args...) where F
-    obj = this
-    local r
-    p = if ismutable(obj)
-        r = obj
-        pointer_from_objref(obj)
-    else
-        # This is the last allocation I'm left with, and I know I can fix it!
-        # This will be fixed in https://github.com/JuliaLang/julia/pull/50136
-        r = Ref(obj)
-        pointer_from_objref(r)
-    end
-    p = reinterpret(Ptr{Cvoid}, p)
-    GC.@preserve r begin
-        return func(p, args...)
-    end
-end
-
+#@noinline function polymorphic_call(func::F, this, args...) where F
+#    obj = this
+#    local r
+#    p = if ismutable(obj)
+#        r = obj
+#        pointer_from_objref(obj)
+#    else
+#        # This is the last allocation I'm left with, and I know I can fix it!
+#        # This will be fixed in https://github.com/JuliaLang/julia/pull/50136
+#        r = Ref(obj)
+#        pointer_from_objref(r)
+#    end
+#    p = reinterpret(Ptr{Cvoid}, p)
+#    GC.@preserve r begin
+#        return func(p, args...)
+#    end
+#end
+#
+fname_mutable(name) = Symbol("@$(name)-mutable")
+fname_immutable(name) = Symbol("@$(name)-immutable")
 
 function _emit_virtual_func(__module__::Module, BaseType, spec, func_expr::Expr)
     name = func_expr.args[1].args[1].args[1]
+    name_mutable = fname_mutable(name)
+    name_immutable = fname_immutable(name)
     return_type = func_expr.args[1].args[2]
     func = Core.eval(__module__, :(function $name end))
     idx = _declare_virtual_method!(spec, func)
     return quote
-        function $(esc(name))(this::Ptr{Cvoid})::$(esc(return_type))
-            p = this
+        # Force inline to ensure no dispatch to this function
+        @inline function $(esc(name_mutable))(obj)::$(esc(return_type))
+            p = _unsafe_pointer_from_objref(obj)
+            return do_dispatch(p::Ptr{Cvoid})
+        end
+        # Force inline to ensure no dispatch to this function
+        @inline function $(esc(name_immutable))(obj)::$(esc(return_type))
+            # This is the last allocation we're left with.. It's the same as seen in
+            # https://github.com/JuliaLang/julia/issues/44244#issuecomment-1236165936
+            # It's annoying, because the whole reason someone is using this `@polymorphic`
+            # call is because they have a dynamic object reference (i.e. a *pointer*), yet
+            # julia won't let us take the address of that object, so we have to _copy_ it
+            # into a new heap allocation just to get its address.
+            # I guess the best approach would be to use mutable objects for polymorphism if
+            # you're going to have them in heap allocated objects anyway.
+            #Core.println("before ref")
+            r = Ref{Any}(obj)
+            ref_ptr = pointer_from_objref(r)
+            GC.@preserve r begin
+                #Core.println("before dispatch")
+                obj_ptr = unsafe_load(reinterpret(Ptr{Ptr{Cvoid}}, ref_ptr))
+                return do_dispatch(obj_ptr::Ptr{Cvoid})
+            end
+        end
+        function do_dispatch(p::Ptr{Cvoid})
             vtable = unsafe_load(reinterpret(Ptr{VTable}, p), 1)
             # TODO: Make this safe
-            f_ptr = @inbounds vtable.func_ptrs[$idx]
+            f_ptr = @inbounds(vtable.func_ptrs[$idx])::Ptr{Cvoid}
             # TODO: arg types
-            ccall(f_ptr, Int, (Ptr{Cvoid},), p)
+            ccall(f_ptr, $return_type, (Ptr{Cvoid},), p)
         end
     end
+end
+function _unsafe_pointer_from_objref(obj)
+    # Copied from base, but remove the redundant `ismutable()` check, since we already
+    # checked it before calling.
+    ccall(:jl_value_ptr, Ptr{Cvoid}, (Any,), obj)
 end
 
 function _emit_override_func(__module__::Module, spec, vtable, type, func_expr::Expr)
     #@assert func_expr.args[1].args[1].args[2].args[2] === :(Ptr{$type})
     fname = gensym(:func)
+    @assert func_expr.args[1].head == :(::) "@override Must specify return value"
+    return_type = func_expr.args[1].args[2]
     wrapper_name = gensym(:wrapper)
     f_ptr_name = gensym(:f_ptr)
     return esc(quote
         const $fname = $func_expr
         $(if ismutabletype(type)
             quote
-                @inline function $wrapper_name(this::Ptr{Cvoid})
+                function $wrapper_name(this::Ptr{Cvoid})
                     o = $unsafe_pointer_to_objref(this)
                     return $fname(o::$type)
                 end
             end
         else
             quote
-                @inline function $wrapper_name(this::Ptr{Cvoid})
+                function $wrapper_name(this::Ptr{Cvoid})
                     o = unsafe_load(reinterpret(Ptr{$type}, this))::$type
                     return $fname(o::$type)
                 end
             end
         end)
         # TODO: arg types
-        const $f_ptr_name = @eval @cfunction($wrapper_name, Int, (Ptr{Cvoid},))
+        const $f_ptr_name = @eval @cfunction($wrapper_name, $return_type, (Ptr{Cvoid},))
         $_define_virtual_method!($spec, $vtable, $fname, $f_ptr_name)
     end)
 end
