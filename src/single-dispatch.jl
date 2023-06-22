@@ -90,24 +90,7 @@ macro polymorphic(call::Expr)
         end
     end)
 end
-#@noinline function polymorphic_call(func::F, this, args...) where F
-#    obj = this
-#    local r
-#    p = if ismutable(obj)
-#        r = obj
-#        pointer_from_objref(obj)
-#    else
-#        # This is the last allocation I'm left with, and I know I can fix it!
-#        # This will be fixed in https://github.com/JuliaLang/julia/pull/50136
-#        r = Ref(obj)
-#        pointer_from_objref(r)
-#    end
-#    p = reinterpret(Ptr{Cvoid}, p)
-#    GC.@preserve r begin
-#        return func(p, args...)
-#    end
-#end
-#
+
 fname_mutable(name) = Symbol("@$(name)-mutable")
 fname_immutable(name) = Symbol("@$(name)-immutable")
 
