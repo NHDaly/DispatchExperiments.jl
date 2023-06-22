@@ -3,10 +3,27 @@ module SingleDispatch
 using Memoize
 using MacroTools
 
+export @base, @extend, @virtual, @overload, @polymorphic
+
+# TODO: Change to this
+"""
+    @interface BaseClass begin
+        @virtual function func1(this, arg1::Int)::ReturnType end
+        @virtual function func2(this)::ReturnType end
+    end
+"""
+macro interface(interface_name, body::Expr)
+    return quote
+        #abstract type
+        $(esc(type_def))
+    end
+end
+
+
 """
     @base abstract type BaseClass end
-    @virtual BaseClass function func1(this::Ptr, arg1) ReturnType end
-    @virtual BaseClass function func2(this::Ptr)::ReturnType end
+    @virtual BaseClass function func1(this, arg1::Int)::ReturnType end
+    @virtual BaseClass function func2(this)::ReturnType end
 """
 macro base(type_def::Expr)
     @assert type_def.head == :abstract
