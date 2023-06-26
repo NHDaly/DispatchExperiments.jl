@@ -6,6 +6,8 @@ module SingleDispatch
 # a Base*). Here, we don't quite have apparent types; julia's type system is a bit looser.
 # We probably will want something like a boundscheck?
 
+# EDIT: done! Added support for Arrays and Refs. Structs are still todo..
+# TODO: Structs, per below.
 # IDEA: We can avoid the allocation for static variables by using the heap-allocated object
 # that's _already there!_ If we need to use `@polymorphic`, then we have something type
 # unstable, by definition, and that will be heap allocated. We can use the macro to make
@@ -17,9 +19,6 @@ module SingleDispatch
 # pull the inner field out of that?
 # If we just have a variable directly, we can't do anything clever, so we'll have to ask
 # users to avoid that.
-
-
-
 
 using Memoize
 using MacroTools
@@ -116,9 +115,22 @@ end
 macro polymorphic(call::Expr)
     @assert call.head == :call
     name = call.args[1]
+    container_name = fname_container(name)
     mutable_name = fname_mutable(name)
     immutable_name = fname_immutable(name)
     this = call.args[2]
+    # Optimization: avoid creating an immutable reference to the object, which we then have to
+    # copy into our Ref! We already _have_ a type unstable ref to the heap-allocated object,
+    # which is why we are doing some polymorphism here anyway!
+    if this isa Expr && this.head === :ref
+        container = this.args[1]
+        idx = this.args[2:end]
+        return esc(quote
+            # No reason to specialize on `Ptr{BaseType}` or whatever. Ptr{Any} is fine.
+            p = reinterpret(Ptr{Any}, $_get_pointer($container, $(idx...)))
+            $container_name(p, $(call.args[3:end]...))
+        end)
+    end
     esc(quote
         this = $this
         if ismutable(this)
@@ -129,6 +141,11 @@ macro polymorphic(call::Expr)
     end)
 end
 
+_get_pointer(a::Array, idx...) = pointer(a, idx...)
+_get_pointer(r::Ref) = convert(Ptr{Any}, r)
+
+
+fname_container(name) = Symbol("@$(name)-container")
 fname_mutable(name) = Symbol("@$(name)-mutable")
 fname_immutable(name) = Symbol("@$(name)-immutable")
 
@@ -143,6 +160,7 @@ end
 
 function _emit_virtual_func(__module__::Module, BaseType, spec, func_expr::Expr)
     name = func_expr.args[1].args[1].args[1]
+    name_container = fname_container(name)
     name_mutable = fname_mutable(name)
     name_immutable = fname_immutable(name)
     return_type = func_expr.args[1].args[2]
@@ -150,6 +168,12 @@ function _emit_virtual_func(__module__::Module, BaseType, spec, func_expr::Expr)
     args, arg_names, arg_types = _args_split(func_expr)
     idx = _declare_virtual_method!(spec, func)
     return quote
+        # Force inline to ensure no dispatch to this function
+        @inline function $(esc(name_container))(box_ptr::Ptr{Any}, args...)::$(esc(return_type))
+            # Now extract the pointer to the actual obj, which is the first element in the box
+            obj_ptr = unsafe_load(reinterpret(Ptr{Ptr{Cvoid}}, box_ptr))
+            return do_dispatch(obj_ptr::Ptr{Cvoid}, args...)
+        end
         # Force inline to ensure no dispatch to this function
         @inline function $(esc(name_mutable))(obj, args...)::$(esc(return_type))
             p = _unsafe_pointer_from_objref(obj)
@@ -167,10 +191,12 @@ function _emit_virtual_func(__module__::Module, BaseType, spec, func_expr::Expr)
             # you're going to have them in heap allocated objects anyway.
             #Core.println("before ref")
             r = Ref{Any}(obj)
+            # Get the pointer to the object pointed to by r, which itself contains a ptr to obj
             ref_ptr = pointer_from_objref(r)
+            # Now extract the pointer to the actual obj, which is the first element in r (r.x)
+            obj_ptr = unsafe_load(reinterpret(Ptr{Ptr{Cvoid}}, ref_ptr))
             GC.@preserve r begin
                 #Core.println("before dispatch")
-                obj_ptr = unsafe_load(reinterpret(Ptr{Ptr{Cvoid}}, ref_ptr))
                 return do_dispatch(obj_ptr::Ptr{Cvoid}, args...)
             end
         end

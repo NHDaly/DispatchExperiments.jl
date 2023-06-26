@@ -71,7 +71,7 @@ end
     @test @allocated(SingleDispatch.@polymorphic func1(dm, 1, 2)) == 0
 end
 
-@testitem "Perf tests" begin
+@testitem "Perf tests - mutable, with return value" begin
 # module M
 #    using Dispatch
 #    using Test
@@ -173,15 +173,15 @@ end
 
     function s1()
         out[] = 0
-        for d in ds
-            vf(d)
+        @inbounds for i in eachindex(ds)
+            vf(ds[i])
         end
         return out[]
     end
     function s2()
         out[] = 0
-        for d in ds
-            SingleDispatch.@polymorphic vf(d)
+        @inbounds for i in eachindex(ds)
+            SingleDispatch.@polymorphic vf(ds[i])
         end
         return out[]
     end
@@ -196,6 +196,72 @@ end
 
 # Another comparison: immutable objects, which will be quite poor for dynamic dispatch right now.
 @testitem "Perf tests - immutable, with return value" begin
+#module M3
+#   using Dispatch
+#   using Test
+    Base.Experimental.@optlevel 2  # Force optimization for tests
+
+    SingleDispatch.@base abstract type BaseClass end
+    SingleDispatch.@virtual BaseClass function vf(this::Ptr)::Int end
+
+    const out = Ref(0)
+
+    SingleDispatch.@extend struct D1 <: BaseClass
+        x::Int
+        @override function vf(this::D1)::Int
+            return this.x + 1
+        end
+    end
+    SingleDispatch.@extend struct D2 <: BaseClass
+        x::Int
+        @override function vf(this::D2)::Int
+            return this.x + 2
+        end
+    end
+    # Add extra subtypes, to avoid over optimization shenanigans
+    struct D3 <: BaseClass x::Int end
+    struct D4 <: BaseClass x::Int end
+    struct D5 <: BaseClass x::Int end
+    struct D6 <: BaseClass x::Int end
+    struct D7 <: BaseClass x::Int end
+    struct D8 <: BaseClass x::Int end
+    vf(::D3) = nothing
+    vf(::D4) = nothing
+    vf(::D5) = nothing
+    vf(::D6) = nothing
+    vf(::D7) = nothing
+    vf(::D8) = nothing
+
+    const ds = BaseClass[rand((D1(0), D2(0))) for _ in 1:1000]
+
+    function s1()
+        out[] = 0
+        @inbounds for i in eachindex(ds)
+            out[] += vf(ds[i])
+        end
+        return out[]
+    end
+    function s2()
+        out[] = 0
+        # Accessing the original Array datastructure directly is important for perf, here
+        # since it allows us to skip working with the type unstable element, and having
+        # to copy it from the Array's box to our own `Ref` box. This way, we get to
+        # preserve the original box. This only matters for immutable objects, since mutable
+        # objects are themselves already heap-allocated.
+        @inbounds for i in eachindex(ds)
+            out[] += SingleDispatch.@polymorphic vf(ds[i])
+        end
+        return out[]
+    end
+
+    @test s1() == s2()
+
+    #@test @allocated(s1()) == @allocated(s2())
+    @time for _ in 1:1_000 s1() end
+    @time for _ in 1:1_000 s2() end
+
+end
+@testitem "Perf tests - immutable, no return value" begin
 #module M3
 #   using Dispatch
 #   using Test
@@ -238,15 +304,15 @@ end
 
     function s1()
         out[] = 0
-        for d in ds
-            vf(d)
+        @inbounds for i in eachindex(ds)
+            vf(ds[i])
         end
         return out[]
     end
     function s2()
         out[] = 0
-        for d in ds
-            SingleDispatch.@polymorphic vf(d)
+        @inbounds for i in eachindex(ds)
+            SingleDispatch.@polymorphic vf(ds[i])
         end
         return out[]
     end
