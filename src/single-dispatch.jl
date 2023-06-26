@@ -1,5 +1,26 @@
 module SingleDispatch
 
+# TODO: How to ensure that the variable passed to @polymorphic call actually implements the
+# interface? In a static language, the interface is part of the type, and you would only
+# be able to invoke the interface on a pointer with an apparent type of that interface (e.g.
+# a Base*). Here, we don't quite have apparent types; julia's type system is a bit looser.
+# We probably will want something like a boundscheck?
+
+# IDEA: We can avoid the allocation for static variables by using the heap-allocated object
+# that's _already there!_ If we need to use `@polymorphic`, then we have something type
+# unstable, by definition, and that will be heap allocated. We can use the macro to make
+# use of the original location. We can check: if it's an Array, we can access it using
+# `pointer()`, if it's a Ref, via `convert(Ptr)`. If it's a field in a struct, we might be
+# more out of luck.. If it's a mutable struct, we can get its pointer and then get the
+# offset. But if it's a field in a stack-allocated struct, there's maybe not much to do.
+# ... OH: I guess we could put THAT instance in a Ref, since we know _its_ type, and then
+# pull the inner field out of that?
+# If we just have a variable directly, we can't do anything clever, so we'll have to ask
+# users to avoid that.
+
+
+
+
 using Memoize
 using MacroTools
 
