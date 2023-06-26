@@ -2,7 +2,7 @@
 
 Implementation of polymorphic single dispatch via Virtual Tables (a la C++'s polymorphism) in Julia.
 
-This could be used for a baseline comparison of the performance of dynamic multiple dispatch in julia against a single dispatch case.
+Mostly this was just for fun. This could maybe also be used for a baseline comparison of the performance of dynamic multiple dispatch in julia against a single dispatch case.
 
 Here is the current state of the comparisons, per the tests.
 Julia's dispatch is the first number, and the package's dispatch is the second number:
