@@ -72,6 +72,15 @@ function profiling()
         @btime physics_system_observe_event($p, $(r), $(r))
         Profile.clear(); @profile for _ in 1:1_000_000 physics_system_observe_event(p, r, r) end; pprof(webport=23223)
         # Profile.Allocs.clear(); Profile.Allocs.@profile for _ in 1:1_000_000 physics_system_observe_event(p, r, r) end; PProf.Allocs.pprof(webport=23224)
+
+        @info "Comparison"
+        obs = Any[a for _ in 1:100]
+        @btime for _ in 1:1_000_000 test_func($obs, $r) end
     end
     @show a.count
+end
+function test_func(observers, r)
+    for o in observers
+        achievements_observe_event(o, r, r)
+    end
 end
