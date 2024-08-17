@@ -6,4 +6,8 @@ using .SingleDispatch
 
 export @base, @extend, @virtual, @overload, @polymorphic
 
+include("interface-implementation.jl")
+using .InterfaceImplementations
+export @interface
+
 end # module Dispatch

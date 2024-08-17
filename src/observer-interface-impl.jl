@@ -115,8 +115,18 @@ end
 
 struct ObserveEventInterface
     callbacks::ObserveEventInterfaceImplementation
-    data::Ptr{Cvoid}
-    data_ref::Any
+    instance::Ptr{Cvoid}
+    instance_ref::Any
+end
+
+function observe_event(c::ObserveEventInterface, event_type, event_data)
+    @ccall $(c.callbacks.observe_event)(c.instance::Ptr{Cvoid}, event_type::Cint, event_data::Cint)::Nothing
+end
+function init_callback(c::ObserveEventInterface)
+    @ccall $(c.callbacks.init_callback)(c.instance::Ptr{Cvoid})::Nothing
+end
+function observee_destructing(c::ObserveEventInterface)
+    @ccall $(c.callbacks.observee_destructing)(c.instance::Ptr{Cvoid})::Nothing
 end
 
 #-------------

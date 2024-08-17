@@ -169,7 +169,7 @@ end
     vf(::D7) = nothing
     vf(::D8) = nothing
 
-    const ds = BaseClass[rand((D1(0), D2(0))) for _ in 1:1000]
+    const ds = BaseClass[rand((D1(rand(Int)), D2(rand(Int)))) for _ in 1:1000]
 
     function s1()
         out[] = 0
@@ -185,12 +185,58 @@ end
         end
         return out[]
     end
-
     @test s1() == s2()
+
+    using FunctionWrappers: FunctionWrapper
+    FT = FunctionWrapper{Nothing, Tuple{Any}}
+    vf_d1 = FT(function (this::D1)
+        out[] += this.x + 1
+        nothing
+    end)
+    vf_d2 = FT(function (this::D2)
+        out[] += this.x + 2
+        nothing
+    end)
+    FT2 = FunctionWrapper{Nothing, Tuple{}}
+    # This is the problem: FT2 is constructing D1/D2; should point to ds instead
+    const closures = FT2[d isa D1 ? FT2(()->vf_d1(d)) : FT2(()->vf_d2(d)) for d in ds]
+    #const closures = FT2[rand((FT2(()->vf_d1(D1(0))), FT2(()->vf_d2(D2(0))))) for _ in 1:1000]
+    function s3()
+        out[] = 0
+        @inbounds for i in eachindex(closures)
+            closures[i]()
+        end
+        return out[]
+    end
+    @test s1() == s2() == s3()
+
+    using Base.Experimental: @opaque
+    of_d1 = function (this::D1)
+        out[] += this.x + 1
+        nothing
+    end
+    of_d2 = function (this::D2)
+        out[] += this.x + 2
+        nothing
+    end
+    # This is the problem: FT2 is constructing D1/D2; should point to ds instead
+    const opaque_closures = [d isa D1 ? @opaque(Tuple{}->Nothing, ()->of_d1(d)) : @opaque(Tuple{}->Nothing, ()->of_d2(d)) for d in ds]
+    #const closures = FT2[rand((FT2(()->vf_d1(D1(0))), FT2(()->vf_d2(D2(0))))) for _ in 1:1000]
+    function s4()
+        out[] = 0
+        @inbounds for i in eachindex(closures)
+            opaque_closures[i]()
+        end
+        return out[]
+    end
+    @test s1() == s2() == s3() == s4()
+
 
     #@test @allocated(s1()) == @allocated(s2())
     @time for _ in 1:1_000 s1() end
     @time for _ in 1:1_000 s2() end
+    @time for _ in 1:1_000 s3() end
+    @time for _ in 1:1_000 s4() end
 
 end
 
@@ -324,3 +370,42 @@ end
     @time for _ in 1:1_000 s2() end
 
 end
+
+
+@testitem "perf experiments" begin
+    using BenchmarkTools
+    @noinline f_return(x::Number, y) = 30000 + x
+    @noinline f_return(x::Array, y) = 40000 + length(x)
+    const sideeffect = Ref{Int}(0)
+    @noinline f_noreturn(x, y::Number) = (sideeffect[] += y; nothing)
+    @noinline f_noreturn(x, y::Array) = (sideeffect[] += length(y); nothing)
+    vs = Any[[] for _ in 1:1000]
+
+    @info "mutable, with immutable return value"
+    @btime for x in $vs
+        f_return(x, x)
+    end
+
+    @info "mutable, no return value"
+    @btime for x in $vs
+        f_noreturn(x, x)
+    end
+
+    @info "immutable, with immutable return value"
+    @btime for i in 1:1000
+        f_return($vs[i], i+5000)
+    end
+
+    @info "immutable, no return value"
+    @btime for i in 1:1000
+        f_noreturn($vs[i], i+5000)
+    end
+
+end
+
+
+
+
+
+
+
