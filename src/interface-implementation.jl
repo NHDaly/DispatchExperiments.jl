@@ -148,7 +148,8 @@ macro implement(interfaces, struct_def)
 
 
 
-    ImplName = Symbol(T_name, interface_name, "Implementation")
+    ImplInstanceName = Symbol(T_name, interface_name, "Implementation")
+    ImplStructName = Symbol(interface_name, "Implementation")
 
     obj_name = gensym("obj")
     wrapper_callbacks = [  # (name, def)
@@ -179,7 +180,7 @@ macro implement(interfaces, struct_def)
 
     convert_def = if ismutable
         :(function Base.convert(::Type{$interface_name}, obj::$T_name)::$interface_name
-            $interface_name($ImplName, pointer_from_objref(obj), obj)
+            $interface_name($ImplInstanceName, pointer_from_objref(obj), obj)
         end)
     else
         # TODO
@@ -197,7 +198,7 @@ macro implement(interfaces, struct_def)
         # TODO: Check function types against type check const from interface
 
         # We eval this const, so that the functions above are defined earlier.
-        const $(ImplName) = eval($(QuoteNode(:(GameObjectInterfaceImplementation(
+        const $(ImplInstanceName) = eval($(QuoteNode(:($ImplStructName(
             $(wrapper_function_defs...)
         )))))
 
