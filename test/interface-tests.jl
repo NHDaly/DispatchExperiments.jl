@@ -180,6 +180,7 @@ end
 
         function Goomba_GameObjectInterface_impl__update(instance::Ptr{Cvoid}, dt::Int)
             obj_ = unsafe_pointer_to_objref(reinterpret(Ptr{Goomba}, instance))::Goomba
+            # TODO: These @inlines prevent @capture from matching. Need to expand them here.
             return @inline update(obj_, dt)
         end
         function Goomba_GameObjectInterface_impl__render(instance::Ptr{Cvoid}, renderer::TextRenderer)
@@ -188,8 +189,8 @@ end
         end
 
         const GoombaGameObjectInterfaceImplementation = eval(:(GameObjectInterfaceImplementation(
-            @cfunction(update, Bool, (Ptr{Cvoid},Int)),
-            @cfunction(render, Bool, (Ptr{Cvoid},TextRenderer)),
+            @cfunction(Goomba_GameObjectInterface_impl__update, Bool, (Ptr{Cvoid},Int)),
+            @cfunction(Goomba_GameObjectInterface_impl__render, Nothing, (Ptr{Cvoid},TextRenderer)),
         )))
 
         function Base.convert(::Type{GameObjectInterface}, obj::Goomba)::GameObjectInterface
@@ -200,6 +201,6 @@ end
     end)
 
     # TODO: It's not possible to get these to match, due to the `@inline` and `eval`
-    #@test @capture(e1, $e2)
+    # @test @capture(e1, $e2)
 end
 
