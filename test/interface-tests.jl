@@ -2,8 +2,8 @@
     struct TextRenderer
         buffer::Vector{UInt8}
     end
-    TextRenderer(s) = TextRenderer(codeunits(s))
-    function render_char(renderer::Renderer, x::Int, c::UInt8)::Nothing
+    TextRenderer(s::AbstractString) = TextRenderer(codeunits(s))
+    function render_char(renderer::TextRenderer, x::Int, c::UInt8)::Nothing
         if x < 1 || x > length(renderer.buffer)
             return nothing
         end
@@ -13,50 +13,52 @@
 
     @interface GameObjectInterface begin
         # Returns true if the object is dead and can be deleted
-        @virtual function update(::GameObjectInterface, dt::Int)::Bool end
-        @virtual function render(::GameObjectInterface, renderer)::Nothing end
+        @virtual function update(::GameObjectInterface, dt::Float64)::Bool end
+        @virtual function render(::GameObjectInterface, renderer::TextRenderer)::Nothing end
     end
 
-    @implement GameObjectInterface mutable struct Player
-        x::Float64
-        vel::Float64  # pixels per second
-        big::Bool
-        mushroom_ref::Union{Nothing, Mushroom}
-
-        @override function update(p::Player, dt::Int)::Bool
-            p.x += p.vel * dt
-            if p.mushroom_ref !== nothing && p.x == p.mushroom_ref.x
-                # Eat the mushroom
-                p.big = true
-                p.mushroom_ref = nothing
-                p.mushroom_ref.dead = true
-            end
-            return false
-        end
-        @override function render(p::Player, renderer::Renderer)::Nothing
-            if p.big
-                render_dot(renderer, p.x, UInt8('P'))
-            else
-                render_dot(renderer, p.x, UInt8('p'))
-            end
-            return nothing
-        end
-    end
-
-    @implement GameObjectInterface mutable struct Mushroom
+    @implement {GameObjectInterface} mutable struct Mushroom
         x::Float64
         vel::Float64  # pixels per second
         dead::Bool  # once it's eaten
 
-        @override function update(p::Mushroom, dt::Int)::Bool
+        @override function update(p::Mushroom, dt::Float64)::Bool
             p.x += p.vel * dt
             if p.dead
                 return true
             end
             return false
         end
-        @override function render(p::Mushroom, renderer::Renderer)::Nothing
-            render_dot(renderer, p.x, UInt8('m'))
+        @override function render(p::Mushroom, renderer::TextRenderer)::Nothing
+            render_char(renderer, Int(round(p.x)), UInt8('m'))
+            return nothing
+        end
+    end
+
+    @implement {GameObjectInterface} mutable struct Player
+        x::Float64
+        vel::Float64  # pixels per second
+        big::Bool
+        mushroom_ref::Union{Nothing, Mushroom}
+
+        @override function update(p::Player, dt::Float64)::Bool
+            p.x += p.vel * dt
+            if p.mushroom_ref !== nothing
+                if Int(round(p.x)) == Int(round(p.mushroom_ref.x))
+                    # Eat the mushroom
+                    p.big = true
+                    p.mushroom_ref.dead = true
+                    p.mushroom_ref = nothing
+                end
+            end
+            return false
+        end
+        @override function render(p::Player, renderer::TextRenderer)::Nothing
+            if p.big
+                render_char(renderer, Int(round(p.x)), UInt8('P'))
+            else
+                render_char(renderer, Int(round(p.x)), UInt8('p'))
+            end
             return nothing
         end
     end
@@ -64,16 +66,19 @@
 
     struct Game
         objects::Vector{GameObjectInterface}
-        renderer::Renderer
+        renderer::TextRenderer
     end
     function Game()
-        m = Mushroom(10.0, -2.0, false)
-        p = Player(0.0, 5.0, false, m)
-        r = TextRenderer("--------------------------------")
+        m = Mushroom(6.0, -0.25, false)
+        p = Player(0.0, 1.0, false, m)
+        r = TextRenderer("")
         return Game(GameObjectInterface[p, m], r)
     end
     function game_loop()
         g = Game()
+        empty = "------------------------------"
+        append!(g.renderer.buffer, codeunits(empty))
+        gamestates = []
         for _ in 1:10
             todelete = Int[]
             for (i,obj) in enumerate(g.objects)
@@ -82,14 +87,27 @@
             end
             deleteat!(g.objects, todelete)
 
+            g.renderer.buffer .= codeunits(empty)
             for obj in g.objects
                 render(obj, g.renderer)
             end
 
-            println(String(copy(g.renderer.buffer)))
+            push!(gamestates, String(copy(g.renderer.buffer)))
         end
+        gamestates
     end
-
+    @test game_loop() == [
+        "p----m------------------------"
+        "-p---m------------------------"
+        "--p-m-------------------------"
+        "---pm-------------------------"
+        "----P-------------------------"
+        "-----P------------------------"
+        "------P-----------------------"
+        "-------P----------------------"
+        "--------P---------------------"
+        "---------P--------------------"
+    ]
 end
 
 @testitem "interface macroexpand" begin
