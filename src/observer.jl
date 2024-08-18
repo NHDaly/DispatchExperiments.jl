@@ -8,6 +8,15 @@ function call_callback(c::ObserveEventCallback, event_type, event_data)
 end
 
 
+# Not type stable :(
+#function make_impl_callback(f::Function, ::Type{T}) where {T}
+#    return function (instance, args...)
+#        obj = unsafe_pointer_to_objref(reinterpret(Ptr{T}, instance))::T
+#        return @inline f(obj, args...)
+#    end
+#end
+
+
 #-------------
 
 mutable struct Achievements
@@ -23,12 +32,13 @@ function achievements_observe_event(achievements::Achievements, event_type, even
     end
     return nothing
 end
+# const achievements_observe_event_callback = make_impl_callback(achievements_observe_event, Achievements)
 function achievements_observe_event_callback(data, event_type, event_data)
-    #println(typeof(data))
-    #@info "got" data
-    achievements = unsafe_pointer_to_objref(reinterpret(Ptr{Achievements}, data))::Achievements
-    #println(pointer_from_objref(achievements))
-    return @inline achievements_observe_event(achievements, event_type, event_data)
+   # println(typeof(data))
+   # @info "got" data
+   achievements = unsafe_pointer_to_objref(reinterpret(Ptr{Achievements}, data))::Achievements
+   # println(pointer_from_objref(achievements))
+   return @inline achievements_observe_event(achievements, event_type, event_data)
 end
 
 function get_achievements_event_callback(achievements)
