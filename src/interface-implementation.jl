@@ -1,3 +1,45 @@
+#=============================
+Some Notes:
+
+- Since these closures are inherently opaque, they prevent optimizations julia could
+otherwise do. So sometimes, this will be slower than julia's built-in dynamic multiple
+dispatch.
+    - For example, if the function actually only has one method-instance, the dispatch
+      can compile away entirely, even if the arguments' types are unknown.
+
+
+Fairest best-case for julia dispatch comparison yet:
+```julia
+julia> @interface TestInterface5 begin
+           @virtual function bumpX!(::TestInterface5)::Nothing end
+       end
+TestInterface5
+
+julia> @implement {TestInterface5} mutable struct TestImpl5
+           x::Int
+           @override function getX(this::TestImpl5)::Nothing
+               this.x += 1
+               nothing
+           end
+       end
+
+julia> obj = TestImpl5(10); @btime for _ in 1:1000  @noinline bumpX!($(obj)) end
+  1.896 μs (0 allocations: 0 bytes)
+
+julia> obj = TestImpl5(10); @btime for _ in 1:1000  @noinline bumpX!($([obj])[1]) end
+  2.639 μs (0 allocations: 0 bytes)
+
+julia> obj = TestImpl5(10); @btime for _ in 1:1000  @noinline bumpX!($(Any[obj])[1]) end
+  8.458 μs (0 allocations: 0 bytes)
+
+julia> obj = TestImpl5(10); @btime for _ in 1:1000  @noinline bumpX!($(TestInterface5[obj])[1]) end
+  4.327 μs (0 allocations: 0 bytes)
+```
+Roughly an extra 1.7 ns overhead per call (4.3 - 2.6), over the ~2ns overhead of a single
+function call. Not bad.
+
+=============================#
+
 module InterfaceImplementations
 
 export @interface, @implement
@@ -7,6 +49,7 @@ using MacroTools
 macro interface(T_name, block)
     function_defs = block.args
     function_names = []
+    function_var_names = []  # If fname is an expression (e.g. Base.foo), make it a var"".
     function_arg_names = []
     function_arg_types = []
     function_return_vals = []
@@ -40,13 +83,14 @@ macro interface(T_name, block)
         @assert arg_types[1] == T_name "First argument of a virtual function must be the interface type. Got $(arg_types[1]) in $(def)."
 
         push!(function_names, fname)
+        push!(function_var_names, Symbol(fname))
         push!(function_arg_names, arg_names[2:end])
         push!(function_arg_types, arg_types[2:end])
         push!(function_return_vals, freturn)
     end
 
     ImplStructName = Symbol(T_name, "Implementation")
-    impl_func_ptr_fields = [:($(fname)::Ptr{Cvoid}) for fname in function_names]
+    impl_func_ptr_fields = [:($(fname_var)::Ptr{Cvoid}) for fname_var in function_var_names]
     obj_arg = gensym("obj")
 
 
@@ -54,12 +98,16 @@ macro interface(T_name, block)
         begin
             fullargs = [:($arg_name::$arg_type) for (arg_name, arg_type) in zip(farg_names, farg_types)]
             :(function $(fname)($(obj_arg)::$(T_name), $(fullargs...))::$(freturn)
-                ccall($(obj_arg).callbacks.$(fname), $(freturn),
-                      (Ptr{Cvoid}, $(farg_types...),), $(obj_arg).instance, $(farg_names...))
+                ccall($(obj_arg).callbacks.$(fname_var), $(freturn),
+                      (Ptr{Cvoid}, Any, $(farg_types...),), $(obj_arg).instance,
+                      # TODO: Maybe make separate "typed" wrapper functions for objects
+                      # with type parameters?
+                      typeof($(obj_arg).instance_ref),
+                      $(farg_names...))
             end)
         end
-        for (fname, farg_names, farg_types, freturn) in
-            zip(function_names, function_arg_names, function_arg_types, function_return_vals)
+        for (fname, fname_var, farg_names, farg_types, freturn) in
+            zip(function_names, function_var_names, function_arg_names, function_arg_types, function_return_vals)
     ]
 
     esc(Base.remove_linenums!(quote
@@ -91,10 +139,13 @@ macro implement(interfaces, struct_def)
             """)
     interface_name = only(interface_names)
 
-    @capture(struct_def, (mutable struct T_name_ body__ end | struct T_name_ body__ end)) ||
-        error("""Expected struct definition. Got: $struct_def.""")
+    @capture(struct_def,
+        (mutable struct T_name_{Params__} body__ end) | (mutable struct T_name_ body__ end)
+        | (      struct T_name_{Params__} body__ end) | (        struct T_name_ body__ end)
+    ) || error("""Expected struct definition. Got: $struct_def.""")
 
     ismutable = struct_def.args[1]
+    has_params = !isempty(Params)
 
     body_keep_exprs = []
     body_override_exprs = []
@@ -110,15 +161,21 @@ macro implement(interfaces, struct_def)
     struct_def.args[3].args = body_keep_exprs
 
     function_names = []
+    function_var_names = []  # If fname is an expression (e.g. Base.foo), make it a var"".
     function_arg_names = []
     function_arg_types = []
     function_return_vals = []
+    function_where_clauses = []
 
     for def in body_override_exprs
         def isa LineNumberNode && continue
 
         match = @capture(def,
-            (function fname_(fargs__)::freturn_  fbody_  end) | (fname_(fargs__)::freturn_ = fbody__))
+            (function fname_(fargs__)::freturn_ fbody_ end) |
+            (function fname_(fargs__)::freturn_ where {WhereTypes__} fbody_ end) |
+            (fname_(fargs__)::freturn_ = fbody_) |
+            (fname_(fargs__)::freturn_ where {WhereTypes__} = fbody_)
+        )
         @assert match """Got unsupported definition: `@override $def`.
             Usage: `@override function fname(::$(T_name), args...)::T ... end`"""
 
@@ -138,12 +195,16 @@ macro implement(interfaces, struct_def)
             push!(arg_names, arg_name)
         end
 
-        @assert arg_types[1] == T_name "First argument of an override function must be the implementation type. Got $(arg_types[1]) in $(def)."
+        arg1 = arg_types[1]
+        @assert(arg1 == T_name || arg1 isa Expr && arg1.args[1] == T_name,
+            "First argument of a virtual function must be the interface type. Got $(arg_types[1]) in $(def). Expected $T_name.")
 
         push!(function_names, fname)
+        push!(function_var_names, Symbol(fname))
         push!(function_arg_names, arg_names[2:end])
         push!(function_arg_types, arg_types[2:end])
         push!(function_return_vals, freturn)
+        push!(function_where_clauses, WhereTypes)
     end
 
 
@@ -156,10 +217,20 @@ macro implement(interfaces, struct_def)
         begin
             wrapper_name = Symbol("$(T_name)_$(interface_name)_impl__$(fname)")
             farg_exprs = [:($arg_name::$arg_type) for (arg_name, arg_type) in zip(farg_names, farg_types)]
-            f = :(function $wrapper_name(instance::Ptr{Cvoid}, $(farg_exprs...))
-                $obj_name = unsafe_pointer_to_objref(reinterpret(Ptr{$T_name}, instance))::$T_name
-                return @inline $fname($obj_name, $(farg_names...))
-            end)
+            # TODO: Handle these separately. For now they're the same.
+            # f = if isempty(Params)
+                f = :(function $wrapper_name(instance::Ptr{Cvoid},
+                 $(Expr(:meta, :nospecialize, :(t::Type{T}))),
+                 $(farg_exprs...))::$freturn where {T}
+                    $obj_name = unsafe_pointer_to_objref(reinterpret(Ptr{$T_name}, instance))::T
+                    return @inline $fname($obj_name, $(farg_names...))
+                end)
+            # else
+            #     :(function $wrapper_name(instance::Ptr{Cvoid}, @nospecialize(::Type{T}), $(farg_exprs...))::$freturn where {T}
+            #         $obj_name = unsafe_pointer_to_objref(reinterpret(Ptr{$T_name}, instance))::$T
+            #         return @inline $fname($obj_name, $(farg_names...))
+            #     end)
+            # end
             (wrapper_name, f)
         end
         for (fname, farg_names, farg_types, freturn) in
@@ -171,7 +242,7 @@ macro implement(interfaces, struct_def)
             #@show fname, farg_types, freturn
             # Expr(:macrocall, Symbol("@cfunction"), fname, freturn, :((Ptr{Cvoid}, $(farg_types...)),))
             wrapper_name = wrapper_callback[1]
-            :(@cfunction($wrapper_name, $freturn, (Ptr{Cvoid}, $(farg_types...),)))
+            :(@cfunction($wrapper_name, $freturn, (Ptr{Cvoid}, Any, $(farg_types...),)))
         end
         for (wrapper_callback, farg_types, freturn) in
             zip(wrapper_callbacks, function_arg_types, function_return_vals)
@@ -179,9 +250,16 @@ macro implement(interfaces, struct_def)
 
 
     convert_def = if ismutable
-        :(function Base.convert(::Type{$interface_name}, obj::$T_name)::$interface_name
-            $interface_name($ImplInstanceName, pointer_from_objref(obj), obj)
-        end)
+        if !has_params
+            :(function Base.convert(::Type{$interface_name}, obj::$T_name)::$interface_name
+                $interface_name($ImplInstanceName, pointer_from_objref(obj), obj)
+            end)
+        else
+            # For structs with type parameters, we need to pass the concrete type through.
+            :(function Base.convert(::Type{$interface_name}, obj::$T_name)::$interface_name
+                $interface_name($ImplInstanceName, pointer_from_objref(obj), obj)
+            end)
+        end
     else
         # TODO
         error("Only supports mutable structs for now")
