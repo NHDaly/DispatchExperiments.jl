@@ -145,7 +145,7 @@ macro implement(interfaces, struct_def)
     ) || error("""Expected struct definition. Got: $struct_def.""")
 
     ismutable = struct_def.args[1]
-    has_params = !isempty(Params)
+    has_params = Params !== nothing && !isempty(Params)
 
     body_keep_exprs = []
     body_override_exprs = []
