@@ -38,6 +38,17 @@ julia> obj = TestImpl5(10); @btime for _ in 1:1000  @noinline bumpX!($(TestInter
 Roughly an extra 1.7 ns overhead per call (4.3 - 2.6), over the ~2ns overhead of a single
 function call. Not bad.
 
+#-------------------------------------------------------------------
+
+Lesson learned:
+- ccall() with arg type `::T` *always copies T* as a pass-by-value.
+    - If you want to pass through a reference to the original mutable obj, you should pass
+      it as `Any`, to simulate passing by a pointer.
+    - But isbits types should stay `::T`, to avoid the allocations.
+    - I *think* this is as simple as `if isimmutable(T) T else Any end`...
+        - But we don't know this at macro parse time....... I wonder if we can put it in
+          the compiled code?
+
 =============================#
 
 module InterfaceImplementations
@@ -98,17 +109,22 @@ macro interface(T_name, block)
         begin
             fullargs = [:($arg_name::$arg_type) for (arg_name, arg_type) in zip(farg_names, farg_types)]
             :(function $(fname)($(obj_arg)::$(T_name), $(fullargs...))::$(freturn)
-                ccall($(obj_arg).callbacks.$(fname_var), $(freturn),
-                      (Ptr{Cvoid}, Any, $(farg_types...),), $(obj_arg).instance,
-                      # TODO: Maybe make separate "typed" wrapper functions for objects
-                      # with type parameters?
-                      typeof($(obj_arg).instance_ref),
-                      $(farg_names...))
+
+                $(@__MODULE__()).do_ccall(
+                        $(obj_arg).callbacks.$(fname_var), $(obj_arg).instance,
+                        $(freturn), Tuple{$(farg_types...)}, $(farg_names...))
             end)
         end
         for (fname, fname_var, farg_names, farg_types, freturn) in
             zip(function_names, function_var_names, function_arg_names, function_arg_types, function_return_vals)
     ]
+
+    init_func = :(function $(Symbol("init_$(ImplStructName)!"))(vtable, $(function_var_names...))
+            $((
+                :(vtable.$(fname_var) = $(fname_var))
+                for fname_var in function_var_names
+            )...)
+        end)
 
     esc(Base.remove_linenums!(quote
         # Will be a single instance (flyweight pattern) for each implementation struct.
@@ -116,6 +132,8 @@ macro interface(T_name, block)
         mutable struct $(ImplStructName)
             $(impl_func_ptr_fields...)
         end
+
+        $(init_func)
 
         # TODO: Add type checking const
 
@@ -131,6 +149,28 @@ macro interface(T_name, block)
     end))
 end
 
+@generated function do_ccall(f, instance, ::Type{RT}, ::Type{ArgTypes}, args...) where {RT, ArgTypes}
+    # Core.println(ArgTypes)
+    carg_types = to_C_type.(fieldtypes(ArgTypes))
+
+    # Core.println(carg_types)
+    expr = :(
+        ccall(f, RT, (Ptr{Cvoid},
+        $(carg_types...),), instance,
+        $((:(args[$i]) for i in 1:length(args))...))
+    )
+    #Core.println(expr)
+    return expr
+end
+function to_C_type(::Type{T}) where T
+    if T == String
+        return Cstring
+    elseif ismutabletype(T)
+        return Any
+    else
+        return T
+    end
+end
 
 macro implement(interfaces, struct_def)
     @capture(interfaces, {interface_names__}) ||
@@ -219,10 +259,8 @@ macro implement(interfaces, struct_def)
             farg_exprs = [:($arg_name::$arg_type) for (arg_name, arg_type) in zip(farg_names, farg_types)]
             # TODO: Handle these separately. For now they're the same.
             # f = if isempty(Params)
-                f = :(function $wrapper_name(instance::Ptr{Cvoid},
-                 $(Expr(:meta, :nospecialize, :(t::Type{T}))),
-                 $(farg_exprs...))::$freturn where {T}
-                    $obj_name = unsafe_pointer_to_objref(reinterpret(Ptr{$T_name}, instance))::T
+                f = :(function $wrapper_name(instance::Ptr{Cvoid}, $(farg_exprs...))::$freturn
+                    $obj_name = unsafe_pointer_to_objref(reinterpret(Ptr{$T_name}, instance))::$(T_name)
                     return @inline $fname($obj_name, $(farg_names...))
                 end)
             # else
@@ -242,12 +280,21 @@ macro implement(interfaces, struct_def)
             #@show fname, farg_types, freturn
             # Expr(:macrocall, Symbol("@cfunction"), fname, freturn, :((Ptr{Cvoid}, $(farg_types...)),))
             wrapper_name = wrapper_callback[1]
-            :(@cfunction($wrapper_name, $freturn, (Ptr{Cvoid}, Any, $(farg_types...),)))
+            (Symbol("construct_$wrapper_name"), :(
+                $(@__MODULE__()).cfunction(Val($wrapper_name), $freturn, Tuple{Ptr{Cvoid}, $(farg_types...)})
+                #carg_types = Tuple($((:(to_C_type(t)) for t in farg_types)...));
+                #@cfunction($wrapper_name, $freturn, (Ptr{Cvoid}, carg_types...))
+            ))
         end
         for (wrapper_callback, farg_types, freturn) in
             zip(wrapper_callbacks, function_arg_types, function_return_vals)
     ]
-
+    toplevel_cfunction_constructors = [
+        begin
+            :($constructor_name() = $f)
+        end
+        for (constructor_name, f) in wrapper_function_defs
+    ]
 
     convert_def = if ismutable
         if !has_params
@@ -265,6 +312,7 @@ macro implement(interfaces, struct_def)
         error("Only supports mutable structs for now")
     end
 
+    init_func = Symbol("init_$(ImplStructName)!")
 
     esc(Base.remove_linenums!(quote
         $struct_def
@@ -275,10 +323,28 @@ macro implement(interfaces, struct_def)
 
         # TODO: Check function types against type check const from interface
 
+
+        $(toplevel_cfunction_constructors...)
+
         # We eval this const, so that the functions above are defined earlier.
         const $(ImplInstanceName) = eval($(QuoteNode(:($ImplStructName(
-            $(wrapper_function_defs...)
+            $((:($f()) for f in first.(wrapper_function_defs))...)
         )))))
+
+        eval($(QuoteNode(:(module $(Symbol("___vtable_init_$(ImplInstanceName)"))
+            using ..$(nameof(__module__)): $(ImplInstanceName), $(init_func)
+
+            function __init__()
+                $(init_func)($(ImplInstanceName),
+                    $((
+                        begin
+                            constructor_name = wrapper_def[1]
+                            :($(__module__).$(constructor_name)())
+                        end
+                        for wrapper_def in wrapper_function_defs
+                    )...))
+            end
+        end))))
 
         $convert_def
 
@@ -286,6 +352,19 @@ macro implement(interfaces, struct_def)
     end))
 
 
+end
+
+# UGH: a generated function here introduces allocations after Module load.
+@generated function cfunction(::Val{F}, ::Type{RT}, ::Type{ArgTypes}) where {F, RT, ArgTypes}
+    Core.println(ArgTypes)
+
+    carg_types = to_C_type.(fieldtypes(ArgTypes))
+    #Core.println(carg_types)
+
+    expr =:( @cfunction($F, $RT, ($(carg_types...),)) )
+    #Core.println(expr)
+
+    return expr
 end
 
 # Example usage to test the macro
