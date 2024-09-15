@@ -279,11 +279,13 @@ macro implement(interfaces, struct_def)
         begin
             #@show fname, farg_types, freturn
             # Expr(:macrocall, Symbol("@cfunction"), fname, freturn, :((Ptr{Cvoid}, $(farg_types...)),))
+            evaled_arg_types = (Core.eval(__module__, arg_type) for arg_type in farg_types)
+            carg_types = to_C_type.(evaled_arg_types)
             wrapper_name = wrapper_callback[1]
             (Symbol("construct_$wrapper_name"), :(
-                $(@__MODULE__()).cfunction(Val($wrapper_name), $freturn, Tuple{Ptr{Cvoid}, $(farg_types...)})
+                # $(@__MODULE__()).cfunction(Val($wrapper_name), $freturn, Tuple{Ptr{Cvoid}, $(farg_types...)})
                 #carg_types = Tuple($((:(to_C_type(t)) for t in farg_types)...));
-                #@cfunction($wrapper_name, $freturn, (Ptr{Cvoid}, carg_types...))
+                @cfunction($wrapper_name, $freturn, (Ptr{Cvoid}, $(carg_types)...))
             ))
         end
         for (wrapper_callback, farg_types, freturn) in
