@@ -279,13 +279,13 @@ macro implement(interfaces, struct_def)
         begin
             #@show fname, farg_types, freturn
             # Expr(:macrocall, Symbol("@cfunction"), fname, freturn, :((Ptr{Cvoid}, $(farg_types...)),))
-            evaled_arg_types = (Core.eval(__module__, arg_type) for arg_type in farg_types)
+            evaled_arg_types = Tuple(Core.eval(__module__, arg_type) for arg_type in farg_types)
             carg_types = to_C_type.(evaled_arg_types)
             wrapper_name = wrapper_callback[1]
             (Symbol("construct_$wrapper_name"), :(
                 # $(@__MODULE__()).cfunction(Val($wrapper_name), $freturn, Tuple{Ptr{Cvoid}, $(farg_types...)})
                 #carg_types = Tuple($((:(to_C_type(t)) for t in farg_types)...));
-                @cfunction($wrapper_name, $freturn, (Ptr{Cvoid}, $(carg_types)...))
+                @cfunction($wrapper_name, $freturn, (Ptr{Cvoid}, $(carg_types...)))
             ))
         end
         for (wrapper_callback, farg_types, freturn) in
@@ -298,14 +298,33 @@ macro implement(interfaces, struct_def)
         for (constructor_name, f) in wrapper_function_defs
     ]
 
+    init_func = Symbol("init_$(ImplStructName)!")
+
+    reinit_func = Symbol("reinit_$(ImplStructName)!")
+    reinit_func_def = :(function $(reinit_func)()
+            #if $(ImplInstanceName).$(first(function_var_names)) === C_NULL
+            #    $(init_func)($(ImplInstanceName),
+            #        $((
+            #            begin
+            #                constructor_name = wrapper_def[1]
+            #                :($(__module__).$(constructor_name)())
+            #            end
+            #            for wrapper_def in wrapper_function_defs
+            #        )...))
+            #end
+        end)
+
+
     convert_def = if ismutable
         if !has_params
             :(function Base.convert(::Type{$interface_name}, obj::$T_name)::$interface_name
+                $reinit_func()
                 $interface_name($ImplInstanceName, pointer_from_objref(obj), obj)
             end)
         else
             # For structs with type parameters, we need to pass the concrete type through.
             :(function Base.convert(::Type{$interface_name}, obj::$T_name)::$interface_name
+                $reinit_func()
                 $interface_name($ImplInstanceName, pointer_from_objref(obj), obj)
             end)
         end
@@ -313,8 +332,6 @@ macro implement(interfaces, struct_def)
         # TODO
         error("Only supports mutable structs for now")
     end
-
-    init_func = Symbol("init_$(ImplStructName)!")
 
     esc(Base.remove_linenums!(quote
         $struct_def
@@ -325,28 +342,25 @@ macro implement(interfaces, struct_def)
 
         # TODO: Check function types against type check const from interface
 
+        $reinit_func_def
 
         $(toplevel_cfunction_constructors...)
 
         # We eval this const, so that the functions above are defined earlier.
         const $(ImplInstanceName) = eval($(QuoteNode(:($ImplStructName(
-            $((:($f()) for f in first.(wrapper_function_defs))...)
+            $((:(Ptr{Cvoid}(C_NULL)) for f in first.(wrapper_function_defs))...)
         )))))
+        # # We eval this const, so that the functions above are defined earlier.
+        # const $(ImplInstanceName) = eval($(QuoteNode(:($ImplStructName(
+        #     $((:($f()) for f in first.(wrapper_function_defs))...)
+        # )))))
 
-        eval($(QuoteNode(:(module $(Symbol("___vtable_init_$(ImplInstanceName)"))
-            using ..$(nameof(__module__)): $(ImplInstanceName), $(init_func)
+        #eval($(QuoteNode(:(module $(Symbol("___vtable_init_$(ImplInstanceName)"))
+        #    using ..$(nameof(__module__)): $(ImplInstanceName), $(init_func)
 
-            function __init__()
-                $(init_func)($(ImplInstanceName),
-                    $((
-                        begin
-                            constructor_name = wrapper_def[1]
-                            :($(__module__).$(constructor_name)())
-                        end
-                        for wrapper_def in wrapper_function_defs
-                    )...))
-            end
-        end))))
+        #    function __init__()
+        #    end
+        #end))))
 
         $convert_def
 
