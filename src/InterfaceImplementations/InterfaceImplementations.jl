@@ -53,6 +53,8 @@ Lesson learned:
 
 module InterfaceImplementations
 
+include("utils.jl")
+
 export @interface, @implement
 
 using MacroTools
