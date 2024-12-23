@@ -102,31 +102,25 @@ macro interface(T_name, block)
         push!(function_return_vals, freturn)
     end
 
-    ImplStructName = Symbol(T_name, "Implementation")
-    impl_func_ptr_fields = [:($(fname_var)::Ptr{Cvoid}) for fname_var in function_var_names]
-    obj_arg = gensym("obj")
+    ImplStructName = impl_struct_name(T_name)
+    impl_func_ptr_fields = [:($(fname_var)::Union{Ptr{Cvoid}, Base.CFunction}) for fname_var in function_var_names]
 
 
     wrapper_function_defs = [
         begin
             fullargs = [:($arg_name::$arg_type) for (arg_name, arg_type) in zip(farg_names, farg_types)]
-            :(function $(fname)($(obj_arg)::$(T_name), $(fullargs...))::$(freturn)
-
+            :(function $(fname)(obj::$(T_name), $(fullargs...))::$(freturn)
+                f = obj.callbacks.$(fname_var)
+                f isa Base.CFunction && (f = f.ptr)
+                instance = pointer_from_objref(obj.instance_ref)
                 $(@__MODULE__()).do_ccall(
-                        $(obj_arg).callbacks.$(fname_var), $(obj_arg).instance,
+                        f, instance,
                         $(freturn), Tuple{$(farg_types...)}, $(farg_names...))
             end)
         end
         for (fname, fname_var, farg_names, farg_types, freturn) in
             zip(function_names, function_var_names, function_arg_names, function_arg_types, function_return_vals)
     ]
-
-    init_func = :(function $(Symbol("init_$(ImplStructName)!"))(vtable, $(function_var_names...))
-            $((
-                :(vtable.$(fname_var) = $(fname_var))
-                for fname_var in function_var_names
-            )...)
-        end)
 
     esc(Base.remove_linenums!(quote
         # Will be a single instance (flyweight pattern) for each implementation struct.
@@ -135,13 +129,10 @@ macro interface(T_name, block)
             $(impl_func_ptr_fields...)
         end
 
-        $(init_func)
-
         # TODO: Add type checking const
 
         struct $T_name
             callbacks::$(ImplStructName)
-            instance::Ptr{Cvoid}
             instance_ref::Any
         end
 
@@ -150,7 +141,11 @@ macro interface(T_name, block)
         $T_name
     end))
 end
+impl_struct_name(T_name) = Symbol(T_name, "VTable")
 
+# Why is this generated? See the "Lessons Learned" at the top. It's to
+# get the right calling conventions for the cfunction. This wouldn't be needed w/
+# opaque-closures! 😎 Waiting for 1.12.
 @generated function do_ccall(f, instance, ::Type{RT}, ::Type{ArgTypes}, args...) where {RT, ArgTypes}
     # Core.println(ArgTypes)
     carg_types = to_C_type.(fieldtypes(ArgTypes))
@@ -250,24 +245,23 @@ macro implement(interfaces, struct_def)
     end
 
 
+    ImplStructName = impl_struct_name(interface_name)
 
-    ImplInstanceName = Symbol(T_name, interface_name, "Implementation")
-    ImplStructName = Symbol(interface_name, "Implementation")
+    InstanceType = :INSTANCE
 
-    obj_name = gensym("obj")
     wrapper_callbacks = [  # (name, def)
         begin
             wrapper_name = Symbol("$(T_name)_$(interface_name)_impl__$(fname)")
             farg_exprs = [:($arg_name::$arg_type) for (arg_name, arg_type) in zip(farg_names, farg_types)]
             # TODO: Handle these separately. For now they're the same.
             # f = if isempty(Params)
-                f = :(function $wrapper_name(instance::Ptr{Cvoid}, $(farg_exprs...))::$freturn
-                    $obj_name = unsafe_pointer_to_objref(reinterpret(Ptr{$T_name}, instance))::$(T_name)
-                    return @inline $fname($obj_name, $(farg_names...))
+                f = :(function(instance::Ptr{Cvoid}, $(farg_exprs...))
+                    obj = unsafe_pointer_to_objref(reinterpret(Ptr{$InstanceType}, instance))::$(InstanceType)
+                    return @inline $fname(obj, $(farg_names...))::$freturn
                 end)
             # else
             #     :(function $wrapper_name(instance::Ptr{Cvoid}, @nospecialize(::Type{T}), $(farg_exprs...))::$freturn where {T}
-            #         $obj_name = unsafe_pointer_to_objref(reinterpret(Ptr{$T_name}, instance))::$T
+            #         obj = unsafe_pointer_to_objref(reinterpret(Ptr{$InstanceType}, instance))::$T
             #         return @inline $fname($obj_name, $(farg_names...))
             #     end)
             # end
@@ -284,52 +278,50 @@ macro implement(interfaces, struct_def)
             evaled_arg_types = Tuple(Core.eval(__module__, arg_type) for arg_type in farg_types)
             carg_types = to_C_type.(evaled_arg_types)
             wrapper_name = wrapper_callback[1]
-            (Symbol("construct_$wrapper_name"), :(
-                # $(@__MODULE__()).cfunction(Val($wrapper_name), $freturn, Tuple{Ptr{Cvoid}, $(farg_types...)})
-                #carg_types = Tuple($((:(to_C_type(t)) for t in farg_types)...));
-                @cfunction($wrapper_name, $freturn, (Ptr{Cvoid}, $(carg_types...)))
-            ))
+            f_instance = wrapper_callback[2]
+            constructor_name = Symbol("construct_$wrapper_name")
+            (constructor_name, :(
+                function $constructor_name(::Type{$InstanceType}) where {$InstanceType} begin
+                    f = $f_instance
+                    # $(@__MODULE__()).cfunction(Val($wrapper_name), $freturn, Tuple{Ptr{Cvoid}, $(farg_types...)})
+                    #carg_types = Tuple($((:(to_C_type(t)) for t in farg_types)...));
+                    return @cfunction($(Expr(:$, :f)), $freturn, (Ptr{Cvoid}, $(carg_types...)))
+                end
+            end))
         end
         for (wrapper_callback, farg_types, freturn) in
             zip(wrapper_callbacks, function_arg_types, function_return_vals)
     ]
-    toplevel_cfunction_constructors = [
-        begin
-            :($constructor_name() = $f)
+    toplevel_cfunction_constructors = last.(wrapper_function_defs)
+
+    vtable_module_name = Symbol("$(ImplStructName)Storage")
+
+    vtable_getter_name = :get_vtable
+    make_vtable_func_name = Symbol("make_$(ImplStructName)")
+    vtable_constructor_defs = quote
+        function $(vtable_getter_name)(::Type{T}) where T
+            v = get(vtables_dict, T, nothing)
+            if v === nothing
+                v = $(make_vtable_func_name)(T)
+                vtables_dict[T] = v
+                return v
+            end
+            return v::$(__module__).$(ImplStructName)
         end
-        for (constructor_name, f) in wrapper_function_defs
-    ]
-
-    init_func = Symbol("init_$(ImplStructName)!")
-
-    reinit_func = Symbol("reinit_$(ImplStructName)!")
-    reinit_func_def = :(function $(reinit_func)()
-            #if $(ImplInstanceName).$(first(function_var_names)) === C_NULL
-            #    $(init_func)($(ImplInstanceName),
-            #        $((
-            #            begin
-            #                constructor_name = wrapper_def[1]
-            #                :($(__module__).$(constructor_name)())
-            #            end
-            #            for wrapper_def in wrapper_function_defs
-            #        )...))
-            #end
-        end)
+        function $(make_vtable_func_name)(::Type{T}) where T
+            return $(__module__).$(ImplStructName)(
+                $((:($(__module__).$constructor(T))
+                    for constructor in first.(wrapper_function_defs))...),
+            )
+        end
+    end
 
 
     convert_def = if ismutable
-        if !has_params
-            :(function Base.convert(::Type{$interface_name}, obj::$T_name)::$interface_name
-                $reinit_func()
-                $interface_name($ImplInstanceName, pointer_from_objref(obj), obj)
-            end)
-        else
-            # For structs with type parameters, we need to pass the concrete type through.
-            :(function Base.convert(::Type{$interface_name}, obj::$T_name)::$interface_name
-                $reinit_func()
-                $interface_name($ImplInstanceName, pointer_from_objref(obj), obj)
-            end)
-        end
+        :(function Base.convert(::Type{$interface_name}, obj::$T_name)::$interface_name
+            vtable = $(vtable_module_name).$(vtable_getter_name)(typeof(obj))
+            $interface_name(vtable, obj)
+        end)
     else
         # TODO
         error("Only supports mutable structs for now")
@@ -340,29 +332,18 @@ macro implement(interfaces, struct_def)
 
         $(body_override_exprs...)
 
-        $((def for (_,def) in wrapper_callbacks)...)
-
         # TODO: Check function types against type check const from interface
-
-        $reinit_func_def
 
         $(toplevel_cfunction_constructors...)
 
-        # We eval this const, so that the functions above are defined earlier.
-        const $(ImplInstanceName) = eval($(QuoteNode(:($ImplStructName(
-            $((:(Ptr{Cvoid}(C_NULL)) for f in first.(wrapper_function_defs))...)
-        )))))
-        # # We eval this const, so that the functions above are defined earlier.
-        # const $(ImplInstanceName) = eval($(QuoteNode(:($ImplStructName(
-        #     $((:($f()) for f in first.(wrapper_function_defs))...)
-        # )))))
-
-        #eval($(QuoteNode(:(module $(Symbol("___vtable_init_$(ImplInstanceName)"))
-        #    using ..$(nameof(__module__)): $(ImplInstanceName), $(init_func)
-
-        #    function __init__()
-        #    end
-        #end))))
+        # We eval the module, so that the functions above are defined earlier.
+        eval($(QuoteNode(:(module $(vtable_module_name)
+            const vtables_dict = $(@__MODULE__()).LockedDict{DataType,$(__module__).$ImplStructName}()
+            function __init__()
+                empty!(vtables_dict)
+            end
+            $(vtable_constructor_defs)
+        end))))
 
         $convert_def
 
