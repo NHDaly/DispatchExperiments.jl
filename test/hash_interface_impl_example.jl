@@ -1,21 +1,24 @@
-# TODO: What if we just make a CFunction closure around the object itself in the first place?
-#  -- Update: Never mind it doesn't work. See `builtin-closures.jl` for results.
+# Interface:
 
-mutable struct HashableInterfaceImplementation
-    # This was the second change: allow "closures" here.
+# Mutable so that we have only a *pointer* to the one shared instance. (In case there are
+# tens of function interfaces in this Interface, to prevent the fat-pointer from being too
+# fat.)
+mutable struct HashableInterfaceVTable
     var"Base.hash"::Union{Ptr{Cvoid}, Base.CFunction}
 end
+# The "fat pointer" to the dynamic object. immutable, so inline-allocated in a vector.
 struct HashableInterface
-    callbacks::HashableInterfaceImplementation
-    instance::Ptr{Cvoid}  # TODO delete this
+    callbacks::HashableInterfaceVTable
     instance_ref::Any
 end
-function Base.hash(var"##obj#247"::HashableInterface, h::UInt)::UInt
-    f = var"##obj#247".callbacks.var"Base.hash"
+function Base.hash(obj::HashableInterface, h::UInt)::UInt
+    f = obj.callbacks.var"Base.hash"
+    instance = pointer_from_objref(obj.instance_ref)
     f isa Base.CFunction && (f = f.ptr)
-    ccall(f, UInt, (Ptr{Cvoid}, UInt), (var"##obj#247").instance, h)
+    return ccall(f, UInt, (Ptr{Cvoid}, UInt), instance, h)
 end
 
+# Implementation of the interface (parameterized on a specific object type).
 mutable struct Hashable{T}
     x::T
 end
@@ -23,35 +26,43 @@ function (Base.hash(x::Hashable{T}, h::UInt)::UInt) where T
     return hash(x.x::T, h)
 end
 
-# This was the key: Use a closure/lambda to capture the type of the object so that the
-# callback can derefernce the pointer to a concrete type.
+# We need to create exactly one vtable per instantiation of the Hashable implementation.
+# Since julia doesn't give us a chance to create a global-const VTable per instantiation of
+# this template, we ask the compiler to create one, and cache it for us.
+# Since the arguments to this function are only compiler-constants (a Type), we should be
+# able to constant-fold this definition, and always return the same shared instance.
+
 # We need to compile a new function for each type. This is the equivalent of putting the
 # typename<T> on a struct's methods in C++. But unlike C++ we can't instantiate compilations
 # when a struct is instantiated, so we need to do so using this closure generator.
-function _HashableHashableInterfaceImplementation(::Type{H}) where H
-    function (var"Hashable_HashableInterface_impl__Base.hash"(instance::Ptr{Cvoid}, h::UInt)::UInt)
-        var"##obj#248" = unsafe_pointer_to_objref(reinterpret(Ptr{H}, instance))::H
-        return begin
-                @inline local var"#224#val" = Base.hash(var"##obj#248", h)
-                var"#224#val"
-            end
+function _HashableHashableInterfaceVTable(::Type{H}) where H
+    # The function pointer casts from Ptr{Cvoid} back to the true type, H:
+    f = (instance::Ptr{Cvoid}, h::UInt) -> begin
+        obj = unsafe_pointer_to_objref(reinterpret(Ptr{H}, instance))::H
+        return Base.hash(obj, h)::UInt
     end
-    return HashableInterfaceImplementation(
-        @cfunction($var"Hashable_HashableInterface_impl__Base.hash", UInt, (Ptr{Cvoid}, UInt))
+    # Return the shared vtable instance
+    return HashableInterfaceVTable(
+        @cfunction($f, UInt, (Ptr{Cvoid}, UInt))
     )
 end
-# # We use a generated function here to cache the vtable instance per type.
-# @generated function HashableHashableInterfaceImplementation(::Type{H}) where H
-#     return _HashableHashableInterfaceImplementation(H)
+# # I considered using a Generated function to enforce that this gets cached, but
+# # I'd prefer to avoid that if possible. This seems like something that should fold
+# # already. The main issue is serializing the opaque closure...
+# @generated function HashableHashableInterfaceVTable(::Type{H}) where H
+#     return _HashableHashableInterfaceVTable(H)
 # end
-function HashableHashableInterfaceImplementation(::Type{H}) where H
+# However, Jameson pointed out that caching mutable objects is really not the compiler's
+# job, and that if you want to cache a mutable object, you should do it yourself, with a
+# (locked) global dict. So that's what we've done here instead.
+function HashableHashableInterfaceVTable(::Type{H}) where H
     v = get(vtables_dict, H, nothing)
     if v === nothing
-        v = _HashableHashableInterfaceImplementation(H)
+        v = _HashableHashableInterfaceVTable(H)
         vtables_dict[H] = v
         return v
     end
-    return v::HashableInterfaceImplementation
+    return v::HashableInterfaceVTable
 end
 
 struct LockedDict{K,V} <: AbstractDict{K,V}
@@ -65,10 +76,10 @@ LockedDict{K,V}() where {K,V} = LockedDict{K,V}(Dict{K,V}(), Threads.SpinLock())
 @inline Base.get(d::LockedDict, args...) = @lock d.lock get(d.dict, args...)
 @inline Base.get!(d::LockedDict, args...) = @lock d.lock get!(d.dict, args...)
 
-const vtables_dict = LockedDict{DataType,HashableInterfaceImplementation}()
+const vtables_dict = LockedDict{DataType,HashableInterfaceVTable}()
 
 function Base.convert(::Type{HashableInterface}, obj::Hashable)::HashableInterface
-    HashableInterface(HashableHashableInterfaceImplementation(typeof(obj)), pointer_from_objref(obj), obj)
+    HashableInterface(HashableHashableInterfaceVTable(typeof(obj)), obj)
 end
 
 function setup()
@@ -79,30 +90,4 @@ function bench(v)
     return hash(v)
 end
 
-
-
-
-
-
-
-
-#-------- Experiments with eliminating allocations for the fixed mutable vtable. --------
-
-# Specify how to compute some vector{T} of results
-struct ComputationSpec{T}
-    # args...
-end
-
-# Do the computation. Returns Vector{T}.
-function compute(spec::ComputationSpec{T}) where {T}
-    if is_noop(spec) # spec is noop, return empty vector
-        # But return the _same_ empty vector always, to avoid allocations.
-        #  (Let's say the caller promises not to mutate it.)
-        return empty_vec(T)
-    else
-        # ... do the computation ...
-    end
-end
-@generated empty_vec(::Type{T}) where {T} = T[]  # Constructs T[] each call..
-is_noop(spec) = true  # for this example, always true
 
