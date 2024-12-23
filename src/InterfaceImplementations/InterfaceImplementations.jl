@@ -38,17 +38,6 @@ julia> obj = TestImpl5(10); @btime for _ in 1:1000  @noinline bumpX!($(TestInter
 Roughly an extra 1.7 ns overhead per call (4.3 - 2.6), over the ~2ns overhead of a single
 function call. Not bad.
 
-#-------------------------------------------------------------------
-
-Lesson learned:
-- ccall() with arg type `::T` *always copies T* as a pass-by-value.
-    - If you want to pass through a reference to the original mutable obj, you should pass
-      it as `Any`, to simulate passing by a pointer.
-    - But isbits types should stay `::T`, to avoid the allocations.
-    - I *think* this is as simple as `if isimmutable(T) T else Any end`...
-        - But we don't know this at macro parse time....... I wonder if we can put it in
-          the compiled code?
-
 =============================#
 
 module InterfaceImplementations
@@ -103,23 +92,28 @@ macro interface(T_name, block)
     end
 
     ImplStructName = impl_struct_name(T_name)
-    impl_func_ptr_fields = [:($(fname_var)::Union{Ptr{Cvoid}, Base.CFunction}) for fname_var in function_var_names]
+
+    farg_types = zip(function_arg_types, function_return_vals)
+
+    closure_types = [
+        :(Core.OpaqueClosure{Tuple{$(args...)}, $(ret)})
+        for (args, ret) in farg_types
+    ]
+    impl_func_ptr_fields = [:($(fname_var)::$(closure_type)) for (fname_var, closure_type)
+        in zip(function_var_names, closure_types)]
 
 
     wrapper_function_defs = [
         begin
-            fullargs = [:($arg_name::$arg_type) for (arg_name, arg_type) in zip(farg_names, farg_types)]
-            :(function $(fname)(obj::$(T_name), $(fullargs...))::$(freturn)
+            fullargs = [:($arg_name::$arg_type) for (arg_name, arg_type) in zip(farg_names, carg_types)]
+            :(function $(fname)(obj::$(T_name), $(fullargs...))
                 f = obj.callbacks.$(fname_var)
-                f isa Base.CFunction && (f = f.ptr)
                 instance = pointer_from_objref(obj.instance_ref)
-                $(@__MODULE__()).do_ccall(
-                        f, instance,
-                        $(freturn), Tuple{$(farg_types...)}, $(farg_names...))
+                return f(instance, $(farg_names...))
             end)
         end
-        for (fname, fname_var, farg_names, farg_types, freturn) in
-            zip(function_names, function_var_names, function_arg_names, function_arg_types, function_return_vals)
+        for (fname, fname_var, farg_names, (carg_types, freturn)) in
+            zip(function_names, function_var_names, function_arg_names, farg_types)
     ]
 
     esc(Base.remove_linenums!(quote
@@ -142,32 +136,6 @@ macro interface(T_name, block)
     end))
 end
 impl_struct_name(T_name) = Symbol(T_name, "VTable")
-
-# Why is this generated? See the "Lessons Learned" at the top. It's to
-# get the right calling conventions for the cfunction. This wouldn't be needed w/
-# opaque-closures! 😎 Waiting for 1.12.
-@generated function do_ccall(f, instance, ::Type{RT}, ::Type{ArgTypes}, args...) where {RT, ArgTypes}
-    # Core.println(ArgTypes)
-    carg_types = to_C_type.(fieldtypes(ArgTypes))
-
-    # Core.println(carg_types)
-    expr = :(
-        ccall(f, RT, (Ptr{Cvoid},
-        $(carg_types...),), instance,
-        $((:(args[$i]) for i in 1:length(args))...))
-    )
-    #Core.println(expr)
-    return expr
-end
-function to_C_type(::Type{T}) where T
-    if T == String
-        return Cstring
-    elseif ismutabletype(T)
-        return Any
-    else
-        return T
-    end
-end
 
 macro implement(interfaces, struct_def)
     @capture(interfaces, {interface_names__}) ||
@@ -252,10 +220,10 @@ macro implement(interfaces, struct_def)
     wrapper_callbacks = [  # (name, def)
         begin
             wrapper_name = Symbol("$(T_name)_$(interface_name)_impl__$(fname)")
-            farg_exprs = [:($arg_name::$arg_type) for (arg_name, arg_type) in zip(farg_names, farg_types)]
+            # farg_exprs = [:($arg_name::$arg_type) for (arg_name, arg_type) in zip(farg_names, farg_types)]
             # TODO: Handle these separately. For now they're the same.
             # f = if isempty(Params)
-                f = :(function(instance::Ptr{Cvoid}, $(farg_exprs...))
+                f = :((instance, $(farg_names...)) -> begin
                     obj = unsafe_pointer_to_objref(reinterpret(Ptr{$InstanceType}, instance))::$(InstanceType)
                     return @inline $fname(obj, $(farg_names...))::$freturn
                 end)
@@ -275,17 +243,16 @@ macro implement(interfaces, struct_def)
         begin
             #@show fname, farg_types, freturn
             # Expr(:macrocall, Symbol("@cfunction"), fname, freturn, :((Ptr{Cvoid}, $(farg_types...)),))
-            evaled_arg_types = Tuple(Core.eval(__module__, arg_type) for arg_type in farg_types)
-            carg_types = to_C_type.(evaled_arg_types)
             wrapper_name = wrapper_callback[1]
             f_instance = wrapper_callback[2]
             constructor_name = Symbol("construct_$wrapper_name")
             (constructor_name, :(
                 function $constructor_name(::Type{$InstanceType}) where {$InstanceType} begin
-                    f = $f_instance
+                    f = Base.Experimental.@opaque Tuple{$(farg_types...)}->$(freturn) $f_instance
                     # $(@__MODULE__()).cfunction(Val($wrapper_name), $freturn, Tuple{Ptr{Cvoid}, $(farg_types...)})
                     #carg_types = Tuple($((:(to_C_type(t)) for t in farg_types)...));
-                    return @cfunction($(Expr(:$, :f)), $freturn, (Ptr{Cvoid}, $(carg_types...)))
+                    # return @cfunction($(Expr(:$, :f)), $freturn, (Ptr{Cvoid}, $(carg_types...)))
+                    return f
                 end
             end))
         end
@@ -351,19 +318,6 @@ macro implement(interfaces, struct_def)
     end))
 
 
-end
-
-# UGH: a generated function here introduces allocations after Module load.
-@generated function cfunction(::Val{F}, ::Type{RT}, ::Type{ArgTypes}) where {F, RT, ArgTypes}
-    Core.println(ArgTypes)
-
-    carg_types = to_C_type.(fieldtypes(ArgTypes))
-    #Core.println(carg_types)
-
-    expr =:( @cfunction($F, $RT, ($(carg_types...),)) )
-    #Core.println(expr)
-
-    return expr
 end
 
 # Example usage to test the macro

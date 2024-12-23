@@ -28,6 +28,7 @@
     # end
 
     @testset "fast vector" begin
+        #//v = Vector{HashableInterface*}()
         v = HashableInterface[Hashable(i) for i in 1:N]
 
         @btime hash($v)  # 11 μs 1001 allocations
